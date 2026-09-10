@@ -1,0 +1,31 @@
+# Secrets & local config
+.env
+*.env
+!.env.example
+
+# Python cruft
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+myenv/
+
+# Local data / outputs
+*.xlsx
+*.csv
+downloads/
+goformz/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# VCS
+.git/
+.gitignore
+
+# Docs not needed in the image
+README.md
+code_changes.md

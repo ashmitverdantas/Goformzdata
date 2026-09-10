@@ -1,0 +1,21 @@
+# --- Core scraping / automation ---
+selenium==4.25.0
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.3.0
+
+# --- Data handling ---
+pandas==2.2.3
+
+# --- Config ---
+python-dotenv==1.0.1
+
+# --- Azure: OneLake upload + auth ---
+azure-identity==1.19.0
+azure-core==1.32.0
+azure-storage-file-datalake==12.17.0
+
+# Note: Document Intelligence is called via the REST API using 'requests',
+# so no azure-ai-documentintelligence SDK dependency is required at runtime.
+# 'openpyxl' and 'azure-ai-formrecognizer' were removed — not used by
+# formsDataDownload.py.

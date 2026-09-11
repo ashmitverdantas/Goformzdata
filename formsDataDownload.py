@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence
-from urllib.parse import urljoin
+from urllib.parse import urlencode, urljoin, urlparse
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -74,10 +75,8 @@ GOFORMZ_PASSWORD = required_env("GOFORMZ_PASSWORD")
 # START_DATE: Optional[str] = optional_env("START_DATE")
 # END_DATE: Optional[str] = optional_env("END_DATE")
 
-START_DATE: Optional[str] = optional_env("START_DATE","2026-08-01",)
-
-END_DATE: Optional[str] = optional_env("END_DATE",
-datetime.now(timezone.utc).date().isoformat(),)
+START_DATE: Optional[str] = optional_env("START_DATE")
+END_DATE: Optional[str] = optional_env("END_DATE")
 
 # --- OneLake / Fabric Lakehouse (service principal) ------------------------
 FABRIC_TENANT_ID = optional_env("TENANT_ID")
@@ -99,6 +98,9 @@ MAX_FORMS = int(optional_env("MAX_FORMS", "500"))
 
 # --- GoFormz web app -------------------------------------------------------
 APP_BASE = optional_env("APP_BASE", "https://app.goformz.com")
+GOFORMZ_FORMS_URL = optional_env("GOFORMZ_FORMS_URL")
+BUSINESS_TIMEZONE = optional_env("BUSINESS_TIMEZONE", "Asia/Kolkata")
+GOFORMZ_PAGE_SIZE = int(optional_env("GOFORMZ_PAGE_SIZE", "100"))
 
 # --- Azure AI Document Intelligence (OCR) ----------------------------------
 AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT = required_env("AZURE_DI_ENDPOINT")
@@ -129,6 +131,8 @@ DOCUMENT_POLL_SECONDS = int(optional_env("DOCUMENT_POLL_SECONDS", "2"))
 # Max seconds we are willing to wait out a GoFormz quota (403) window before
 # giving up. Keep below the Container Apps Job replica-timeout.
 MAX_QUOTA_WAIT_SECONDS = int(optional_env("MAX_QUOTA_WAIT_SECONDS", "900"))
+MAX_QUOTA_RETRIES_PER_FORM = int(optional_env("MAX_QUOTA_RETRIES_PER_FORM", "5"))
+MAX_JOB_RUNTIME_SECONDS = int(optional_env("MAX_JOB_RUNTIME_SECONDS", "14400"))
 
 # Fail the run if EVERY record is Failed/Partial (data-quality gate).
 FAIL_IF_ALL_PARTIAL = env_flag("FAIL_IF_ALL_PARTIAL", True)
@@ -202,9 +206,10 @@ class Settings:
 
 @dataclass(frozen=True)
 class ExtractionParameters:
-    start_date: date
-    end_date: date
+    start_date: Optional[date]
+    end_date: Optional[date]
     max_forms: int
+    use_url_filter: bool = False
 
 
 @dataclass(frozen=True)
@@ -258,6 +263,81 @@ def get_default_date_range(
     completed_friday = completed_thursday - timedelta(days=6)
     return completed_friday.isoformat(), completed_thursday.isoformat()
 
+def build_completed_week_forms_url(
+    reference_datetime: Optional[datetime] = None,
+) -> tuple[str, date, date]:
+    try:
+        business_tz = ZoneInfo(BUSINESS_TIMEZONE or "Asia/Kolkata")
+    except Exception as exc:
+        raise ValueError(
+            f"Invalid BUSINESS_TIMEZONE: {BUSINESS_TIMEZONE}"
+        ) from exc
+
+    if reference_datetime is None:
+        current_business_time = datetime.now(business_tz)
+    elif reference_datetime.tzinfo is None:
+        current_business_time = reference_datetime.replace(
+            tzinfo=business_tz
+        )
+    else:
+        current_business_time = reference_datetime.astimezone(business_tz)
+
+    today = current_business_time.date()
+
+    # Monday=0, Tuesday=1, Wednesday=2, Thursday=3, Friday=4
+    days_since_thursday = (today.weekday() - 3) % 7
+    completed_thursday = today - timedelta(days=days_since_thursday)
+    completed_friday = completed_thursday - timedelta(days=6)
+
+    start_local = datetime.combine(
+        completed_friday,
+        datetime.min.time(),
+        tzinfo=business_tz,
+    )
+
+    # Use next Friday minus 1 millisecond to avoid manually constructing
+    # 23:59:59.999.
+    next_friday_local = datetime.combine(
+        completed_thursday + timedelta(days=1),
+        datetime.min.time(),
+        tzinfo=business_tz,
+    )
+    end_local = next_friday_local - timedelta(milliseconds=1)
+
+    start_utc = start_local.astimezone(timezone.utc)
+    end_utc = end_local.astimezone(timezone.utc)
+
+    def format_goformz_utc(value: datetime) -> str:
+        return value.strftime("%Y-%m-%dT%H:%M:%S.") + (
+            f"{value.microsecond // 1000:03d}Z"
+        )
+
+    query = urlencode(
+        {
+            "startdate": format_goformz_utc(start_utc),
+            "enddate": format_goformz_utc(end_utc),
+            "selectedfilter": "custom",
+            "pagesize": str(GOFORMZ_PAGE_SIZE),
+        }
+    )
+
+    forms_url = f"{APP_BASE.rstrip('/')}/forms?{query}"
+
+    LOGGER.info(
+        "Completed weekly business window: %s 00:00:00 through "
+        "%s 23:59:59.999 %s.",
+        completed_friday,
+        completed_thursday,
+        BUSINESS_TIMEZONE,
+    )
+    LOGGER.info(
+        "GoFormz UTC window: %s through %s.",
+        format_goformz_utc(start_utc),
+        format_goformz_utc(end_utc),
+    )
+
+    return forms_url, completed_friday, completed_thursday
+
 
 def parse_input_date(value: Optional[str], name: str) -> Optional[date]:
     if value is None or not str(value).strip():
@@ -283,6 +363,87 @@ def resolve_date_range(
         )
     return parsed_start, parsed_end
 
+
+def validate_goformz_forms_url(value: str) -> str:
+    """Validate that GOFORMZ_FORMS_URL is a plain, trusted Forms URL."""
+    cleaned = value.strip()
+    if "<a " in cleaned.lower() or "</a>" in cleaned.lower():
+        raise ValueError(
+            "GOFORMZ_FORMS_URL must contain only the plain URL, not an HTML <a> tag."
+        )
+    parsed = urlparse(cleaned)
+    if parsed.scheme != "https" or parsed.hostname != "app.goformz.com":
+        raise ValueError("GOFORMZ_FORMS_URL must use https://app.goformz.com.")
+    if parsed.path.rstrip("/") != "/forms":
+        raise ValueError("GOFORMZ_FORMS_URL must point to the GoFormz /forms page.")
+    if not parsed.query:
+        raise ValueError("GOFORMZ_FORMS_URL must include filter query parameters.")
+    return cleaned
+
+
+def resolve_extraction_mode(
+    start_date: Optional[str],
+    end_date: Optional[str],
+    forms_url: Optional[str],
+) -> tuple[Optional[date], Optional[date], Optional[str], bool]:
+    """
+    Select one extraction mode:
+
+    1. GOFORMZ_FORMS_URL:
+       Manual URL override for testing or backfill.
+
+    2. START_DATE plus END_DATE:
+       Manual date backfill mode.
+
+    3. Nothing supplied:
+       Automatic completed Friday-to-Thursday weekly mode.
+    """
+    has_url = bool(forms_url and forms_url.strip())
+    has_start = bool(start_date and str(start_date).strip())
+    has_end = bool(end_date and str(end_date).strip())
+
+    if has_url and (has_start or has_end):
+        raise ValueError(
+            "Choose one extraction mode only: GOFORMZ_FORMS_URL, or both "
+            "START_DATE and END_DATE."
+        )
+
+    if has_start != has_end:
+        raise ValueError(
+            "Date mode requires both START_DATE and END_DATE."
+        )
+
+    # Manual URL override
+    if has_url:
+        validated_url = validate_goformz_forms_url(forms_url or "")
+        return None, None, validated_url, True
+
+    # Manual backfill mode
+    if has_start and has_end:
+        resolved_start, resolved_end = resolve_date_range(
+            start_date,
+            end_date,
+        )
+
+        if resolved_start > resolved_end:
+            raise ValueError(
+                "START_DATE cannot be later than END_DATE."
+            )
+
+        return resolved_start, resolved_end, None, False
+
+    # Default production schedule mode
+    weekly_url, weekly_start, weekly_end = (
+        build_completed_week_forms_url()
+    )
+
+    LOGGER.info(
+        "Automatic weekly mode selected for %s through %s.",
+        weekly_start,
+        weekly_end,
+    )
+
+    return None, None, weekly_url, True
 
 # ===========================================================================
 # 4) General helpers
@@ -1136,14 +1297,14 @@ def _go_to_next_page(
             locals().get("current_page", "unknown"),
         )
         return False
-
+    
 
 def enumerate_forms_from_ui(
-    driver: webdriver.Chrome,
+    driver: webdriver.Chrome, forms_url: str,
 ) -> list[dict[str, Any]]:
     """Walk the Forms grid in the UI and collect all visible forms."""
     LOGGER.info("Opening Forms list in the web UI.")
-    driver.get(f"{APP_BASE}/forms")
+    driver.get(forms_url)
     WebDriverWait(driver, LIST_PAGE_WAIT).until(
         lambda d: d.find_elements(
             By.CSS_SELECTOR, "a[href*='/forms/'], tr[data-formid]"
@@ -1610,9 +1771,19 @@ class SessionManager:
 
     def close(self) -> None:
         if self.app_session is not None:
-            self.app_session.close()
+            try:
+                self.app_session.close()
+            except Exception as exc:
+                LOGGER.warning("Could not close HTTP session cleanly: %s", exc)
+            finally:
+                self.app_session = None
         if self.driver is not None:
-            self.driver.quit()
+            try:
+                self.driver.quit()
+            except Exception as exc:
+                LOGGER.warning("Could not close Selenium cleanly: %s", exc)
+            finally:
+                self.driver = None
 
 
 def wait_out_quota(seconds: float) -> None:
@@ -1779,17 +1950,37 @@ def process_forms(
     records = []
     index = 0
     total = len(form_items)
+    started_at = time.monotonic()
+    quota_retries: dict[str, int] = {}
     while index < total:
+        elapsed = time.monotonic() - started_at
+        if elapsed >= MAX_JOB_RUNTIME_SECONDS:
+            raise TimeoutError(
+                f"Maximum job runtime exceeded after {elapsed:.0f} seconds; "
+                f"processed {index} of {total} forms."
+            )
         item = form_items[index]
         LOGGER.info("Processing form %s of %s.", index + 1, total)
         try:
             record = extract_form_details(item, settings, manager)
         except GoFormzQuotaError as exc:
-            # Quota hit: wait out the window (capped) and retry the same form.
+            # Bound quota retries so a permanently exhausted account cannot loop forever.
+            form_key = get_nested_id(item) or f"index-{index}"
+            attempt = quota_retries.get(form_key, 0) + 1
+            quota_retries[form_key] = attempt
+            if attempt > MAX_QUOTA_RETRIES_PER_FORM:
+                raise GoFormzQuotaError(
+                    f"Quota remained exhausted for form {form_key} after "
+                    f"{MAX_QUOTA_RETRIES_PER_FORM} retries."
+                ) from exc
             retry_after = 60.0
             match = re.search(r"Retry-After=(\d+)", str(exc))
             if match:
                 retry_after = float(match.group(1))
+            LOGGER.warning(
+                "Quota retry %s/%s for form %s.",
+                attempt, MAX_QUOTA_RETRIES_PER_FORM, form_key,
+            )
             wait_out_quota(retry_after)
             continue  # retry same index
         except Exception as exc:
@@ -1822,15 +2013,20 @@ def process_forms(
         format="%Y-%m-%d %I:%M %p",
         errors="coerce",
     )
-    in_range = (
-        (dataframe["_created_sort"].dt.date >= parameters.start_date)
-        & (dataframe["_created_sort"].dt.date <= parameters.end_date)
-    )
     unresolved = dataframe["_created_sort"].isna()
+    if parameters.use_url_filter:
+        selected = dataframe
+    else:
+        if parameters.start_date is None or parameters.end_date is None:
+            raise RuntimeError("Date boundaries are missing in date-range mode.")
+        in_range = (
+            (dataframe["_created_sort"].dt.date >= parameters.start_date)
+            & (dataframe["_created_sort"].dt.date <= parameters.end_date)
+        )
+        selected = dataframe.loc[in_range | unresolved]
     dataframe = (
-        dataframe.loc[in_range | unresolved]
-        .sort_values(by=["_created_sort", "_updated_sort"],
-                     ascending=[False, False], na_position="last")
+        selected.sort_values(by=["_created_sort", "_updated_sort"],
+                             ascending=[False, False], na_position="last")
         .head(parameters.max_forms)
         .drop(columns=["_created_sort", "_updated_sort"])
         .reset_index(drop=True)
@@ -1960,14 +2156,18 @@ def enforce_quality_gate(dataframe: pd.DataFrame) -> None:
 
 
 def run_extraction(
-    settings: Settings, parameters: ExtractionParameters
+    settings: Settings, parameters: ExtractionParameters, forms_url: str
 ) -> tuple[pd.DataFrame, str]:
     manager = SessionManager()
     try:
         manager.start()
-        all_forms = enumerate_forms_from_ui(manager.driver)
+        all_forms = enumerate_forms_from_ui(manager.driver, forms_url)
         LOGGER.info("Total forms discovered in UI: %s.", len(all_forms))
-        candidates = filter_candidate_forms(all_forms, parameters)
+        if parameters.use_url_filter:
+            candidates = list(all_forms)
+            LOGGER.info("URL-filter mode: using %s forms returned by GoFormz.", len(candidates))
+        else:
+            candidates = filter_candidate_forms(all_forms, parameters)
         dataframe = process_forms(candidates, settings, parameters, manager)
         log_summary(dataframe)
         enforce_quality_gate(dataframe)
@@ -2002,26 +2202,44 @@ def main(
     max_forms: int = MAX_FORMS, log_level: str = "INFO",
 ) -> tuple[pd.DataFrame, str]:
     configure_logging(log_level)
-    resolved_start, resolved_end = resolve_date_range(start_date, end_date)
-    if resolved_start > resolved_end:
-        raise ValueError("START_DATE cannot be later than END_DATE.")
-
+    if max_forms <= 0:
+        raise ValueError("MAX_FORMS must be greater than zero.")
+    if MAX_QUOTA_RETRIES_PER_FORM < 0:
+        raise ValueError("MAX_QUOTA_RETRIES_PER_FORM cannot be negative.")
+    if MAX_JOB_RUNTIME_SECONDS <= 0:
+        raise ValueError("MAX_JOB_RUNTIME_SECONDS must be greater than zero.")
+    resolved_start, resolved_end, resolved_url, use_url_filter = (
+        resolve_extraction_mode(start_date, end_date, GOFORMZ_FORMS_URL)
+    )
     parameters = ExtractionParameters(
-        start_date=resolved_start, end_date=resolved_end, max_forms=max_forms
+        start_date=resolved_start,
+        end_date=resolved_end,
+        max_forms=max_forms,
+        use_url_filter=use_url_filter,
     )
     settings = build_settings()
-
-    LOGGER.info(
-        "Extraction range: %s to %s.",
-        parameters.start_date, parameters.end_date,
-    )
-    dataframe, output_path = run_extraction(settings, parameters)
+    if use_url_filter:
+        forms_url = resolved_url or f"{APP_BASE}/forms"
+        LOGGER.info("Extraction mode: GOFORMZ_FORMS_URL filter.")
+    else:
+        forms_url = f"{APP_BASE}/forms"
+        LOGGER.info(
+            "Extraction mode: START_DATE/END_DATE (%s to %s).",
+            parameters.start_date, parameters.end_date,
+        )
+    dataframe, output_path = run_extraction(settings, parameters, forms_url)
     LOGGER.info("Forms returned: %s.", len(dataframe))
     LOGGER.info("Output path: %s.", output_path)
     return dataframe, output_path
 
 
 if __name__ == "__main__":
-    # Any unhandled exception exits non-zero so the Container Apps Job is
-    # correctly marked as Failed.
-    main()
+    # Log the full traceback and re-raise so Azure Container Apps marks the job failed.
+    try:
+        main()
+    except KeyboardInterrupt:
+        LOGGER.warning("Extraction interrupted by shutdown signal.")
+        raise
+    except Exception:
+        LOGGER.exception("Fatal extraction failure.")
+        raise

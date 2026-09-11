@@ -20,6 +20,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -70,8 +71,13 @@ GOFORMZ_EMAIL = required_env("GOFORMZ_EMAIL")
 GOFORMZ_PASSWORD = required_env("GOFORMZ_PASSWORD")
 
 # --- Date range (inclusive). Empty -> completed last Friday..Thursday. ------
-START_DATE: Optional[str] = optional_env("START_DATE")
-END_DATE: Optional[str] = optional_env("END_DATE")
+# START_DATE: Optional[str] = optional_env("START_DATE")
+# END_DATE: Optional[str] = optional_env("END_DATE")
+
+START_DATE: Optional[str] = optional_env("START_DATE","2026-08-01",)
+
+END_DATE: Optional[str] = optional_env("END_DATE",
+datetime.now(timezone.utc).date().isoformat(),)
 
 # --- OneLake / Fabric Lakehouse (service principal) ------------------------
 FABRIC_TENANT_ID = optional_env("TENANT_ID")
@@ -384,10 +390,20 @@ def get_last_updated(record: dict[str, Any]) -> Optional[str]:
     )
     if not value:
         return None
-    parsed = pd.to_datetime(value, errors="coerce", utc=True)
+    cleaned = clean_text(value)
+    if not cleaned:
+        return None
+    has_timezone = bool(re.search(
+        r"(?:\bUTC\b|\bGMT\b|Z$|[+-]\d{2}:?\d{2}$)",
+        cleaned,
+        re.IGNORECASE,
+    ))
+    parsed = pd.to_datetime(cleaned, errors="coerce", utc=has_timezone)
     if pd.notna(parsed):
-        return parsed.strftime("%Y-%m-%d %I:%M %p UTC")
-    return clean_text(value)
+        if has_timezone:
+            return parsed.strftime("%Y-%m-%d %I:%M %p UTC")
+        return parsed.strftime("%Y-%m-%d %I:%M %p")
+    return cleaned
 
 
 def build_form_url(form_id: Optional[str], app_base: str) -> Optional[str]:
@@ -564,6 +580,10 @@ def build_requests_session_from_driver(
 NEXT_PAGE_SELECTORS = (
     "button[aria-label='Next']",
     "button[aria-label='Next page']",
+    "button[title='Next Page']",
+    "button.next-page",
+    ".pagination button.next",
+    ".pagination .next button",
     "a[rel='next']",
     "li.pagination-next:not(.disabled) a",
 )
@@ -571,66 +591,462 @@ NEXT_PAGE_SELECTORS = (
 FORM_ID_RE = re.compile(r"/forms/([0-9a-fA-F-]{6,})")
 
 
-def _collect_forms_on_page(
+def _visible_text_at_column(
     driver: webdriver.Chrome,
-) -> list[dict[str, Any]]:
-    """Scrape form id / name / owner / last-updated from one grid page."""
-    found: dict[str, dict[str, Any]] = {}
+    header_text: str,
+    row_y: float,
+    row_height: float = 42.0,
+) -> Optional[str]:
+    """
+    Read a value from the exact Forms-list column and exact visual row.
 
-    for anchor in driver.find_elements(By.CSS_SELECTOR, "a[href*='/forms/']"):
-        try:
-            href = anchor.get_attribute("href") or ""
-            match = FORM_ID_RE.search(href)
-            if not match:
-                continue
-            form_id = match.group(1)
-            name = clean_text(anchor.get_attribute("title") or anchor.text)
-            row = {"id": form_id, "name": name}
-            try:
-                tr = anchor.find_element(By.XPATH, "./ancestor-or-self::tr[1]")
-                cells = [clean_text(td.text)
-                         for td in tr.find_elements(By.CSS_SELECTOR, "td")]
-                cells = [c for c in cells if c]
-                if cells:
-                    if not row.get("name"):
-                        row["name"] = cells[0]
-                    for cell in cells:
-                        if extract_date_from_text(cell):
-                            row.setdefault("lastUpdated", cell)
-                        elif cell != row.get("name"):
-                            row.setdefault("owner", cell)
-            except Exception:
-                pass
-            found[form_id] = {
-                **found.get(form_id, {}),
-                **{k: v for k, v in row.items() if v},
+    Column boundaries are calculated from the visible grid headers.
+    This prevents values from Form Name, ID badges, adjacent rows, or
+    adjacent columns from being returned as Owner or Last Updated.
+    """
+    script = r"""
+        const wanted = String(arguments[0] || "").trim().toLowerCase();
+        const rowY = Number(arguments[1]);
+        const rowHeight = Number(arguments[2]);
+
+        const normalize = value =>
+            String(value || "").replace(/\s+/g, " ").trim();
+
+        const isVisible = element => {
+            if (!element) return false;
+
+            const rect = element.getBoundingClientRect();
+            const style = window.getComputedStyle(element);
+
+            return (
+                rect.width > 0 &&
+                rect.height > 0 &&
+                style.display !== "none" &&
+                style.visibility !== "hidden" &&
+                Number(style.opacity || 1) !== 0 &&
+                rect.bottom > 0 &&
+                rect.top < window.innerHeight
+            );
+        };
+
+        const allElements = Array.from(
+            document.querySelectorAll("body *")
+        ).filter(isVisible);
+
+        /*
+         * Identify the smallest visible element for every Forms-grid header.
+         * The header positions are then used to calculate real column bounds.
+         */
+        const expectedHeaders = new Set([
+            "all",
+            "status",
+            "form name",
+            "owner",
+            "last updated",
+            "actions"
+        ]);
+
+        const headerCandidates = allElements.filter(element => {
+            const text = normalize(
+                element.innerText || element.textContent
+            ).toLowerCase();
+
+            if (!expectedHeaders.has(text)) {
+                return false;
             }
+
+            /*
+             * Reject large wrapper elements that contain a smaller element
+             * with the same header text.
+             */
+            return !Array.from(element.children).some(child => {
+                const childText = normalize(
+                    child.innerText || child.textContent
+                ).toLowerCase();
+
+                return childText === text && isVisible(child);
+            });
+        });
+
+        /*
+         * Keep the lowest visible header set. This avoids matching navigation
+         * text such as "Forms" above the actual grid.
+         */
+        const wantedHeaders = headerCandidates.filter(element => {
+            const text = normalize(
+                element.innerText || element.textContent
+            ).toLowerCase();
+
+            return text === wanted;
+        });
+
+        if (!wantedHeaders.length) {
+            return null;
+        }
+
+        wantedHeaders.sort((first, second) =>
+            second.getBoundingClientRect().top -
+            first.getBoundingClientRect().top
+        );
+
+        const targetHeader = wantedHeaders[0];
+        const targetHeaderRect = targetHeader.getBoundingClientRect();
+        const targetHeaderY =
+            targetHeaderRect.top + targetHeaderRect.height / 2;
+
+        /*
+         * Use only headers on the same horizontal header line.
+         */
+        const sameLineHeaders = headerCandidates
+            .filter(element => {
+                const rect = element.getBoundingClientRect();
+                const centerY = rect.top + rect.height / 2;
+                return Math.abs(centerY - targetHeaderY) <= 20;
+            })
+            .map(element => {
+                const rect = element.getBoundingClientRect();
+
+                return {
+                    element: element,
+                    text: normalize(
+                        element.innerText || element.textContent
+                    ).toLowerCase(),
+                    left: rect.left,
+                    right: rect.right,
+                    centerX: rect.left + rect.width / 2
+                };
+            })
+            .sort((first, second) => first.centerX - second.centerX);
+
+        const targetIndex = sameLineHeaders.findIndex(item =>
+            item.element === targetHeader ||
+            item.text === wanted
+        );
+
+        if (targetIndex < 0) {
+            return null;
+        }
+
+        const target = sameLineHeaders[targetIndex];
+        const previous = (
+            targetIndex > 0
+                ? sameLineHeaders[targetIndex - 1]
+                : null
+        );
+        const next = (
+            targetIndex < sameLineHeaders.length - 1
+                ? sameLineHeaders[targetIndex + 1]
+                : null
+        );
+
+        /*
+         * Boundaries are halfway between neighboring header centers.
+         * No hard-coded screen pixel position is required.
+         */
+        const columnLeft = previous
+            ? (previous.centerX + target.centerX) / 2
+            : Math.max(0, target.left - 80);
+
+        const columnRight = next
+            ? (target.centerX + next.centerX) / 2
+            : Math.min(window.innerWidth, target.right + 250);
+
+        /*
+         * Use a narrow row band. Do not use ±100 pixels because that can
+         * include two or more neighboring rows.
+         */
+        const rowTolerance = Math.min(
+            Math.max(rowHeight * 0.40, 10),
+            18
+        );
+
+        const candidates = allElements
+            .map(element => {
+                const rect = element.getBoundingClientRect();
+                const text = normalize(
+                    element.innerText || element.textContent
+                );
+                const centerX = rect.left + rect.width / 2;
+                const centerY = rect.top + rect.height / 2;
+
+                return {
+                    element: element,
+                    text: text,
+                    rect: rect,
+                    centerX: centerX,
+                    centerY: centerY
+                };
+            })
+            .filter(item => {
+                if (!item.text) {
+                    return false;
+                }
+
+                if (
+                    item.centerY <= targetHeaderRect.bottom ||
+                    Math.abs(item.centerY - rowY) > rowTolerance
+                ) {
+                    return false;
+                }
+
+                /*
+                 * The complete element must substantially overlap the desired
+                 * column. This rejects the Form Name container and ID badge
+                 * when extracting Owner.
+                 */
+                const overlap = Math.max(
+                    0,
+                    Math.min(item.rect.right, columnRight) -
+                    Math.max(item.rect.left, columnLeft)
+                );
+
+                const requiredOverlap = Math.min(
+                    item.rect.width * 0.60,
+                    25
+                );
+
+                if (
+                    item.centerX <= columnLeft ||
+                    item.centerX >= columnRight ||
+                    overlap < requiredOverlap
+                ) {
+                    return false;
+                }
+
+                /*
+                 * Reject wrapper elements when a visible child in the same row
+                 * and same column contains useful text.
+                 */
+                const hasUsefulChild = Array.from(
+                    item.element.children
+                ).some(child => {
+                    if (!isVisible(child)) {
+                        return false;
+                    }
+
+                    const childText = normalize(
+                        child.innerText || child.textContent
+                    );
+
+                    if (!childText) {
+                        return false;
+                    }
+
+                    const childRect = child.getBoundingClientRect();
+                    const childCenterX =
+                        childRect.left + childRect.width / 2;
+                    const childCenterY =
+                        childRect.top + childRect.height / 2;
+
+                    return (
+                        childCenterX > columnLeft &&
+                        childCenterX < columnRight &&
+                        Math.abs(childCenterY - rowY) <= rowTolerance
+                    );
+                });
+
+                return !hasUsefulChild;
+            });
+
+        if (!candidates.length) {
+            return null;
+        }
+
+        /*
+         * Prefer the item closest to the row center and then closest to the
+         * target column center.
+         */
+        candidates.sort((first, second) => {
+            const firstScore =
+                Math.abs(first.centerY - rowY) * 100 +
+                Math.abs(first.centerX - target.centerX);
+
+            const secondScore =
+                Math.abs(second.centerY - rowY) * 100 +
+                Math.abs(second.centerX - target.centerX);
+
+            return firstScore - secondScore;
+        });
+
+        return candidates[0].text || null;
+    """
+
+    try:
+        value = driver.execute_script(
+            script,
+            header_text,
+            row_y,
+            row_height,
+        )
+        return clean_text(value)
+    except Exception as exc:
+        LOGGER.warning(
+            "Could not read column %s at row y=%s: %s",
+            header_text,
+            row_y,
+            exc,
+        )
+        return None
+
+
+def _extract_values_from_form_row(
+    anchor: Any,
+) -> tuple[Optional[str], Optional[str]]:
+    """Read Owner and Last Updated from the anchor's exact Forms-list row.
+
+    GoFormz uses div-based rows, not a traditional HTML table. Reading the
+    closest ``.data-table-row`` is therefore much more reliable than matching
+    elements by screen coordinates. The selectors also match the supplied
+    GoFormz HTML snapshots.
+    """
+    owner = None
+    last_updated = None
+
+    row = None
+    for xpath in (
+        "./ancestor::div[contains(concat(' ', normalize-space(@class), ' '), ' data-table-row ')][1]",
+        "./ancestor::*[@role='row'][1]",
+        "./ancestor::tr[1]",
+    ):
+        try:
+            row = anchor.find_element(By.XPATH, xpath)
+            if row is not None:
+                break
         except Exception:
             continue
 
-    for tr in driver.find_elements(
-        By.CSS_SELECTOR, "tr[data-formid], [data-formid]"
-    ):
+    if row is None:
+        return None, None
+
+    owner_selectors = (
+        ".owner-col .owner-link",
+        ".owner-col button",
+        ".owner-col",
+        "[data-testid='owner']",
+        "[data-testid*='owner']",
+    )
+    updated_selectors = (
+        ".lastupdated-col",
+        ".last-updated-col",
+        "[data-testid='lastUpdatedDate']",
+        "[data-testid*='lastUpdated']",
+    )
+
+    for selector in owner_selectors:
         try:
-            form_id = tr.get_attribute("data-formid")
-            if not form_id:
-                continue
-            cells = [clean_text(td.text)
-                     for td in tr.find_elements(By.CSS_SELECTOR, "td")]
-            cells = [c for c in cells if c]
-            row: dict[str, Any] = {"id": form_id}
-            if cells:
-                row["name"] = cells[0]
-                for cell in cells[1:]:
-                    if extract_date_from_text(cell):
-                        row.setdefault("lastUpdated", cell)
-                    else:
-                        row.setdefault("owner", cell)
-            found[form_id] = {
-                **found.get(form_id, {}),
-                **{k: v for k, v in row.items() if v},
-            }
+            for element in row.find_elements(By.CSS_SELECTOR, selector):
+                value = clean_text(
+                    element.get_attribute('innerText') or element.text
+                )
+                if value and value.lower() != 'owner':
+                    owner = value
+                    break
+            if owner:
+                break
         except Exception:
+            continue
+
+    for selector in updated_selectors:
+        try:
+            for element in row.find_elements(By.CSS_SELECTOR, selector):
+                value = clean_text(
+                    element.get_attribute('innerText') or element.text
+                )
+                if value and re.search(
+                    r"\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}\s+(?:AM|PM)",
+                    value,
+                    re.IGNORECASE,
+                ):
+                    last_updated = value
+                    break
+            if last_updated:
+                break
+        except Exception:
+            continue
+
+    # Final row-text fallback for small future layout changes. This is scoped
+    # to the exact row, so it cannot accidentally take data from another row.
+    try:
+        row_text = clean_text(row.get_attribute('innerText') or row.text) or ''
+        if not last_updated:
+            match = re.search(
+                r"\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}\s+(?:AM|PM)",
+                row_text,
+                re.IGNORECASE,
+            )
+            if match:
+                last_updated = match.group(0)
+    except Exception:
+        pass
+
+    return owner, last_updated
+
+
+def _collect_forms_on_page(
+    driver: webdriver.Chrome,
+) -> list[dict[str, Any]]:
+    """Scrape Form ID, Form Name, Owner and Last Updated from one page."""
+    found: dict[str, dict[str, Any]] = {}
+    anchors = driver.find_elements(
+        By.CSS_SELECTOR,
+        "a.form-name[href*='/forms/'], a[href*='/forms/']",
+    )
+
+    for anchor in anchors:
+        try:
+            href = anchor.get_attribute('href') or ''
+            match = FORM_ID_RE.search(href)
+            if not match or not anchor.is_displayed():
+                continue
+
+            form_id = match.group(1)
+            form_name = clean_text(
+                anchor.get_attribute('title') or
+                anchor.get_attribute('innerText') or
+                anchor.text
+            )
+
+            # Primary extraction: exact DOM row and semantic column classes.
+            owner, last_updated = _extract_values_from_form_row(anchor)
+
+            # Coordinate fallback remains useful if GoFormz removes row classes.
+            if not owner or not last_updated:
+                position = driver.execute_script(
+                    """
+                    const rect = arguments[0].getBoundingClientRect();
+                    const row = arguments[0].closest('.data-table-row, [role=\"row\"], tr');
+                    const rowRect = row ? row.getBoundingClientRect() : rect;
+                    return {
+                        y: rowRect.top + rowRect.height / 2,
+                        height: rowRect.height || 42
+                    };
+                    """,
+                    anchor,
+                )
+                row_y = float(position['y'])
+                row_height = float(position.get('height') or 42.0)
+                if not owner:
+                    owner = _visible_text_at_column(
+                        driver, 'Owner', row_y, row_height
+                    )
+                if not last_updated:
+                    last_updated = _visible_text_at_column(
+                        driver, 'Last Updated', row_y, row_height
+                    )
+
+            row_data = {
+                'id': form_id,
+                'name': form_name,
+                'owner': clean_text(owner),
+                'lastUpdated': clean_text(last_updated),
+            }
+            existing = found.get(form_id, {})
+            found[form_id] = {
+                **existing,
+                **{key: value for key, value in row_data.items() if value},
+            }
+        except Exception as exc:
+            LOGGER.warning('Could not parse a Forms-list row: %s', exc)
             continue
 
     return list(found.values())
@@ -650,27 +1066,76 @@ def _page_marker(driver: webdriver.Chrome) -> Optional[str]:
 
 
 def _go_to_next_page(
-    driver: webdriver.Chrome, previous_marker: Optional[str]
+    driver: webdriver.Chrome,
+    previous_marker: Optional[str],
 ) -> bool:
-    """Click Next and confirm the grid content actually changed."""
+    """Move to the next GoFormz Forms-list page.
+
+    GoFormz renders the current page number inside an input. The input value is
+    not included in the parent's innerText, so parsing text such as "Page 1 of
+    10" is unreliable. Increment the input directly and confirm that the first
+    form ID changes. At the final page the marker will not change, so False is
+    returned and enumeration stops safely.
+    """
+    # First try any explicit next-page control exposed by the current layout.
     for selector in NEXT_PAGE_SELECTORS:
         try:
-            buttons = driver.find_elements(By.CSS_SELECTOR, selector)
-            for btn in buttons:
-                if btn.is_displayed() and btn.is_enabled():
-                    driver.execute_script("arguments[0].click();", btn)
-                    try:
-                        WebDriverWait(driver, LIST_PAGE_WAIT).until(
-                            lambda d: _page_marker(d) not in (
-                                None, previous_marker
-                            )
-                        )
-                        return True
-                    except Exception:
-                        return False
+            for button in driver.find_elements(By.CSS_SELECTOR, selector):
+                classes = (button.get_attribute("class") or "").lower()
+                disabled = (
+                    not button.is_enabled()
+                    or button.get_attribute("disabled") is not None
+                    or button.get_attribute("aria-disabled") == "true"
+                    or "disabled" in classes
+                )
+                if not button.is_displayed() or disabled:
+                    continue
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center'});",
+                    button,
+                )
+                driver.execute_script("arguments[0].click();", button)
+                WebDriverWait(driver, LIST_PAGE_WAIT).until(
+                    lambda d: _page_marker(d) not in (None, previous_marker)
+                )
+                time.sleep(0.75)
+                return True
         except Exception:
             continue
-    return False
+
+    # Reliable fallback for the actual GoFormz pagination control.
+    try:
+        page_input = WebDriverWait(driver, LIST_PAGE_WAIT).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, ".pagination-text input")
+            )
+        )
+        current_page = int(
+            clean_text(page_input.get_attribute("value")) or "1"
+        )
+        next_page = current_page + 1
+
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});",
+            page_input,
+        )
+        page_input.click()
+        page_input.send_keys(Keys.CONTROL, "a")
+        page_input.send_keys(str(next_page))
+        page_input.send_keys(Keys.ENTER)
+
+        WebDriverWait(driver, LIST_PAGE_WAIT).until(
+            lambda d: _page_marker(d) not in (None, previous_marker)
+        )
+        time.sleep(0.75)
+        LOGGER.info("Moved to Forms-list page %s.", next_page)
+        return True
+    except Exception:
+        LOGGER.info(
+            "No additional Forms-list page was loaded after page %s.",
+            locals().get("current_page", "unknown"),
+        )
+        return False
 
 
 def enumerate_forms_from_ui(
@@ -1190,6 +1655,60 @@ def extract_form_details(
                         raise
 
                 soup = BeautifulSoup(rendered_html, "html.parser")
+                if not soup.select_one(".page-wrapper"):
+                    driver = manager.driver
+
+                    if driver is None:
+                        raise GoFormzError(
+                            "Selenium driver is unavailable."
+                        )
+
+                    driver.get(form_url)
+
+                    WebDriverWait(
+                        driver,
+                        LIST_PAGE_WAIT,
+                    ).until(
+                        lambda current_driver:
+                            current_driver.find_elements(
+                                By.CSS_SELECTOR,
+                                ".page-wrapper",
+                            )
+                    )
+
+                    WebDriverWait(
+                        driver,
+                        LIST_PAGE_WAIT,
+                    ).until(
+                        lambda current_driver:
+                            current_driver.find_elements(
+                                By.CSS_SELECTOR,
+                                (
+                                    '.page-wrapper '
+                                    '[data-testid="label-text"], '
+                                    '.page-wrapper input[value], '
+                                    '.page-wrapper textarea'
+                                ),
+                            )
+                    )
+
+                    time.sleep(0.75)
+
+                    rendered_html = driver.page_source
+
+                    soup = BeautifulSoup(
+                        rendered_html,
+                        "html.parser",
+                    )
+
+                    # Refresh the requests session with the current Selenium cookies.
+                    if manager.app_session is not None:
+                        manager.app_session.close()
+
+                    manager.app_session = (
+                        build_requests_session_from_driver(driver)
+                    )
+
                 positioned_items = extract_dom_positioned_text(soup)
                 backgrounds = extract_page_backgrounds(
                     soup, settings.app_base
@@ -1299,7 +1818,9 @@ def process_forms(
         dataframe["Created Date"], errors="coerce"
     )
     dataframe["_updated_sort"] = pd.to_datetime(
-        dataframe["Last Updated"], errors="coerce", utc=True
+        dataframe["Last Updated"],
+        format="%Y-%m-%d %I:%M %p",
+        errors="coerce",
     )
     in_range = (
         (dataframe["_created_sort"].dt.date >= parameters.start_date)

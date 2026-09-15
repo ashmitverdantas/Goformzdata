@@ -95,6 +95,10 @@ REQUIRE_ONELAKE_UPLOAD = env_flag("REQUIRE_ONELAKE_UPLOAD", True)
 
 # Safety cap so a bad run doesn't open thousands of forms.
 MAX_FORMS = int(optional_env("MAX_FORMS", "500"))
+# Optional hard cap on how many forms are actually PROCESSED (HTML/OCR opened).
+# Unlike MAX_FORMS (which only trims final output rows), this limits the work
+# done. Leave empty in production; set e.g. 10 for a quick test run.
+MAX_FORMS_TO_PROCESS = optional_env("MAX_FORMS_TO_PROCESS")
 
 # --- GoFormz web app -------------------------------------------------------
 APP_BASE = optional_env("APP_BASE", "https://app.goformz.com")
@@ -144,6 +148,7 @@ FAIL_IF_ALL_PARTIAL = env_flag("FAIL_IF_ALL_PARTIAL", True)
 OUTPUT_COLUMNS = [
     "Form ID",
     "Form Name",
+    "Status",
     "Report Type",
     "Owner",
     "Last Updated",
@@ -520,6 +525,13 @@ def get_owner(record: dict[str, Any]) -> Optional[str]:
         record,
         ("owner", "ownerName", "formOwner", "assignedTo", "assignedToName",
          "assignee", "user", "createdBy"),
+    )
+
+
+def get_status(record: dict[str, Any]) -> Optional[str]:
+    return find_value_recursively(
+        record,
+        ("status", "formStatus", "formState", "state", "workflowStatus"),
     )
 
 
@@ -1052,8 +1064,8 @@ def _visible_text_at_column(
 
 def _extract_values_from_form_row(
     anchor: Any,
-) -> tuple[Optional[str], Optional[str]]:
-    """Read Owner and Last Updated from the anchor's exact Forms-list row.
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Read Owner, Last Updated and Status from the anchor's exact Forms-list row.
 
     GoFormz uses div-based rows, not a traditional HTML table. Reading the
     closest ``.data-table-row`` is therefore much more reliable than matching
@@ -1062,6 +1074,7 @@ def _extract_values_from_form_row(
     """
     owner = None
     last_updated = None
+    status = None
 
     row = None
     for xpath in (
@@ -1077,7 +1090,7 @@ def _extract_values_from_form_row(
             continue
 
     if row is None:
-        return None, None
+        return None, None, None
 
     owner_selectors = (
         ".owner-col .owner-link",
@@ -1091,6 +1104,14 @@ def _extract_values_from_form_row(
         ".last-updated-col",
         "[data-testid='lastUpdatedDate']",
         "[data-testid*='lastUpdated']",
+    )
+    status_selectors = (
+        ".status-col .status-text",
+        ".status-col span",
+        ".status-col",
+        ".form-status",
+        "[data-testid='status']",
+        "[data-testid*='status']",
     )
 
     for selector in owner_selectors:
@@ -1125,6 +1146,20 @@ def _extract_values_from_form_row(
         except Exception:
             continue
 
+    for selector in status_selectors:
+        try:
+            for element in row.find_elements(By.CSS_SELECTOR, selector):
+                value = clean_text(
+                    element.get_attribute('innerText') or element.text
+                )
+                if value and value.lower() != 'status':
+                    status = value
+                    break
+            if status:
+                break
+        except Exception:
+            continue
+
     # Final row-text fallback for small future layout changes. This is scoped
     # to the exact row, so it cannot accidentally take data from another row.
     try:
@@ -1137,16 +1172,26 @@ def _extract_values_from_form_row(
             )
             if match:
                 last_updated = match.group(0)
+        if not status:
+            match = re.search(
+                r"\b(Draft|Complete[d]?|In Progress|Submitted|Approved|"
+                r"Rejected|Pending|Archived|Void(?:ed)?|Locked|New|Open|"
+                r"Closed|Review)\b",
+                row_text,
+                re.IGNORECASE,
+            )
+            if match:
+                status = match.group(1)
     except Exception:
         pass
 
-    return owner, last_updated
+    return owner, last_updated, status
 
 
 def _collect_forms_on_page(
     driver: webdriver.Chrome,
 ) -> list[dict[str, Any]]:
-    """Scrape Form ID, Form Name, Owner and Last Updated from one page."""
+    """Scrape Form ID, Form Name, Status, Owner and Last Updated from one page."""
     found: dict[str, dict[str, Any]] = {}
     anchors = driver.find_elements(
         By.CSS_SELECTOR,
@@ -1168,10 +1213,10 @@ def _collect_forms_on_page(
             )
 
             # Primary extraction: exact DOM row and semantic column classes.
-            owner, last_updated = _extract_values_from_form_row(anchor)
+            owner, last_updated, status = _extract_values_from_form_row(anchor)
 
             # Coordinate fallback remains useful if GoFormz removes row classes.
-            if not owner or not last_updated:
+            if not owner or not last_updated or not status:
                 position = driver.execute_script(
                     """
                     const rect = arguments[0].getBoundingClientRect();
@@ -1194,12 +1239,17 @@ def _collect_forms_on_page(
                     last_updated = _visible_text_at_column(
                         driver, 'Last Updated', row_y, row_height
                     )
+                if not status:
+                    status = _visible_text_at_column(
+                        driver, 'Status', row_y, row_height
+                    )
 
             row_data = {
                 'id': form_id,
                 'name': form_name,
                 'owner': clean_text(owner),
                 'lastUpdated': clean_text(last_updated),
+                'status': clean_text(status),
             }
             existing = found.get(form_id, {})
             found[form_id] = {
@@ -1929,6 +1979,7 @@ def extract_form_details(
     return {
         "Form ID": form_id,
         "Form Name": form_name,
+        "Status": get_status(list_record),
         "Report Type": parsed_name["Report Type"],
         "Owner": get_owner(list_record),
         "Last Updated": get_last_updated(list_record),
@@ -1989,6 +2040,7 @@ def process_forms(
             name_has_date = bool(parse_form_name(form_name)["Created Date"])
             record = {
                 "Form ID": form_id, "Form Name": form_name,
+                "Status": get_status(item),
                 "Report Type": None, "Owner": get_owner(item),
                 "Last Updated": get_last_updated(item),
                 **build_date_columns(None),
@@ -2168,6 +2220,18 @@ def run_extraction(
             LOGGER.info("URL-filter mode: using %s forms returned by GoFormz.", len(candidates))
         else:
             candidates = filter_candidate_forms(all_forms, parameters)
+
+        # Optional test cap: only process the first N forms (most recently
+        # updated, since GoFormz returns the list in that order).
+        if MAX_FORMS_TO_PROCESS:
+            limit = int(MAX_FORMS_TO_PROCESS)
+            if limit > 0 and len(candidates) > limit:
+                LOGGER.info(
+                    "MAX_FORMS_TO_PROCESS active: processing only first %s "
+                    "of %s candidate forms.", limit, len(candidates),
+                )
+                candidates = candidates[:limit]
+
         dataframe = process_forms(candidates, settings, parameters, manager)
         log_summary(dataframe)
         enforce_quality_gate(dataframe)
